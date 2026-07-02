@@ -1,0 +1,64 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #f5f0e8;
+  --card: #ffffff;
+  --muted: #78716c;
+  --accent: #0d9488;
+  --border: #e5ddd0;
+}
+
+html, body, #__next {
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: #1c1917;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: hidden;
+}
+
+.container {
+  @apply max-w-6xl mx-auto px-4;
+}
+
+.card {
+  background: var(--card);
+  border-radius: 0.75rem;
+  padding: 1.25rem;
+  border: 1px solid var(--border);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+
+.btn {
+  @apply inline-flex items-center justify-center rounded-lg px-3 py-1.5 text-sm font-medium;
+}
+
+.btn-accent {
+  background: #0d9488;
+  color: white;
+}
+
+.muted { color: var(--muted); }
+
+input, select, textarea {
+  color-scheme: light;
+}
+
+/* Voice recorder audio bar animation */
+.audio-bar {
+  width: 3px;
+  border-radius: 9999px;
+  background: #0d9488;
+  animation: audioBarPulse 0.75s ease-in-out infinite;
+  transform-origin: center;
+}
+
+@keyframes audioBarPulse {
+  0%, 100% { transform: scaleY(0.25); opacity: 0.5; }
+  50% { transform: scaleY(1); opacity: 1; }
+}

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <!-- Mic capsule -->
+  <rect x="10" y="2" width="12" height="18" rx="6" stroke="#0d9488" stroke-width="2.5"/>
+  <!-- Heartbeat/trend line inside mic -->
+  <polyline points="10,11 12.5,11 14,8 16,14.5 17.5,8.5 19.5,11 22,11" stroke="#0d9488" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Stand arc -->
+  <path d="M6 19 Q6 27 16 27 Q26 27 26 19" stroke="#0d9488" stroke-width="2.5" stroke-linecap="round"/>
+  <!-- Vertical post -->
+  <line x1="16" y1="27" x2="16" y2="30" stroke="#0d9488" stroke-width="2.5" stroke-linecap="round"/>
+  <!-- Base bar -->
+  <line x1="11" y1="30" x2="21" y2="30" stroke="#0d9488" stroke-width="2.5" stroke-linecap="round"/>
+</svg>
