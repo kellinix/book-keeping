@@ -108,5 +108,3 @@ DATABASE_URL=postgres://user:pass@host:5432/dbname npm run db:apply:psql
 	 - By default receipts are stored in Supabase Storage. To enable server-side OCR using Tesseract, set `ENABLE_TESSERACT=1` in your server environment. OCR may be slow and requires additional runtime resources.
  - Improve AI categorisation (train/store models or rules)
  - Add Stripe for SaaS billing and multi-business/team support
-
-If you want, I can further polish the UI with `shadcn/ui` components, add end-to-end tests (Playwright), or wire up Stripe billing.
