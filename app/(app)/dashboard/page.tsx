@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { supabase } from "../../../lib/supabaseClient";
 import { formatCurrency, summarizeDirectorExpenses, summarizeTransactions, TransactionRecord } from "../../../lib/voiceledger";
+import { fetchAllTransactions } from "../../../lib/transactionQueries";
 
 function smoothPath(pts: { x: number; y: number }[]): string {
   if (pts.length < 2) return "";
@@ -34,25 +35,52 @@ export default function DashboardPage() {
   const [transactions, setTransactions] = useState<TransactionRecord[]>([]);
   const [currency, setCurrency] = useState("GBP");
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
 
   useEffect(() => {
     let mounted = true;
+    let channel: ReturnType<typeof supabase.channel> | null = null;
     const load = async () => {
       setLoading(true);
-      const user = (await supabase.auth.getUser()).data.user;
-      if (!user) { setLoading(false); return; }
-      const [{ data: txs }, { data: biz }] = await Promise.all([
-        supabase.from("transactions").select("*").eq("user_id", user.id).order("transaction_date", { ascending: false }).limit(500),
-        supabase.from("businesses").select("base_currency").eq("owner_id", user.id).maybeSingle()
-      ]);
-      if (mounted) {
-        setTransactions((txs ?? []) as TransactionRecord[]);
-        setCurrency(biz?.base_currency ?? "GBP");
+      setLoadError("");
+      try {
+        const user = (await supabase.auth.getUser()).data.user;
+        if (!user) return;
+        const refresh = async () => {
+          try {
+            const [txs, { data: biz, error: businessError }] = await Promise.all([
+              fetchAllTransactions(user.id),
+              supabase.from("businesses").select("base_currency").eq("owner_id", user.id).order("created_at", { ascending: true }).limit(1).maybeSingle()
+            ]);
+            if (businessError) throw businessError;
+            if (mounted) {
+              setTransactions(txs);
+              setCurrency(biz?.base_currency ?? "GBP");
+              setLoadError("");
+            }
+          } catch (error) {
+            if (mounted) setLoadError(error instanceof Error ? error.message : "The dashboard could not be loaded.");
+          }
+        };
+        await refresh();
+        // React Strict Mode mounts, cleans up, and mounts effects again in development.
+        // Do not subscribe after an effect instance has already been cleaned up.
+        if (!mounted) return;
+        channel = supabase
+          .channel(`dashboard-transactions-${user.id}-${crypto.randomUUID()}`)
+          .on("postgres_changes", { event: "*", schema: "public", table: "transactions", filter: `user_id=eq.${user.id}` }, () => { void refresh(); })
+          .subscribe();
+      } catch (error) {
+        if (mounted) setLoadError(error instanceof Error ? error.message : "The dashboard could not be loaded.");
+      } finally {
+        if (mounted) setLoading(false);
       }
-      setLoading(false);
     };
     load();
-    return () => { mounted = false; };
+    return () => {
+      mounted = false;
+      if (channel) void supabase.removeChannel(channel);
+    };
   }, []);
 
   const summary = useMemo(() => summarizeTransactions(transactions), [transactions]);
@@ -65,24 +93,24 @@ export default function DashboardPage() {
       const key = `${year}-${String(m + 1).padStart(2, "0")}`;
       const label = new Date(year, m, 1).toLocaleString(undefined, { month: "short" });
       const monthTxs = transactions.filter(tx => (tx.transaction_date || "").slice(0, 7) === key);
-      const income = monthTxs.filter(tx => tx.type === "income").reduce((s, tx) => s + Number(tx.amount || 0), 0);
-      const expense = monthTxs.filter(tx => tx.type === "expense").reduce((s, tx) => s + Number(tx.amount || 0), 0);
-      return { key, label, income, expense };
+      const monthSummary = summarizeTransactions(monthTxs);
+      return { key, label, income: monthSummary.totalIncome, expense: monthSummary.deductibleExpenses };
     });
   }, [transactions]);
 
   const { incomePct, expensePct } = useMemo(() => {
     const now = new Date();
-    const monthTotal = (ago: number, type: string) => {
+    const monthSummary = (ago: number) => {
       const d = new Date(now);
       d.setMonth(d.getMonth() - ago);
       const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-      return transactions.filter(tx => tx.type === type && (tx.transaction_date || "").slice(0, 7) === key)
-        .reduce((s, tx) => s + Number(tx.amount || 0), 0);
+      return summarizeTransactions(transactions.filter(tx => (tx.transaction_date || "").slice(0, 7) === key));
     };
+    const current = monthSummary(0);
+    const previous = monthSummary(1);
     return {
-      incomePct: calcPct(monthTotal(0, "income"), monthTotal(1, "income")),
-      expensePct: calcPct(monthTotal(0, "expense"), monthTotal(1, "expense")),
+      incomePct: calcPct(current.totalIncome, previous.totalIncome),
+      expensePct: calcPct(current.deductibleExpenses, previous.deductibleExpenses),
     };
   }, [transactions]);
 
@@ -119,13 +147,19 @@ export default function DashboardPage() {
 
       {loading ? (
         <div className="card muted">Loading...</div>
+      ) : loadError ? (
+        <div className="card border-rose-200 bg-rose-50 text-rose-800">
+          <p className="font-semibold">The dashboard could not be loaded</p>
+          <p className="mt-1 text-sm">{loadError}</p>
+          <button type="button" onClick={() => window.location.reload()} className="btn mt-3 border border-rose-300 bg-white text-rose-700">Try again</button>
+        </div>
       ) : (
         <>
           {/* Metric cards */}
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-            <MetricCard label="Total income" value={formatCurrency(summary.totalIncome, currency)} change={incomePct} positiveIsGood />
-            <MetricCard label="Total expenses" value={formatCurrency(summary.totalExpenses, currency)} change={expensePct} positiveIsGood={false} />
-            <MetricCard label="Net profit / loss" value={formatCurrency(summary.estimatedProfit, currency)} helper="Revenue minus expenses" highlight={summary.estimatedProfit >= 0 ? "good" : "bad"} />
+            <MetricCard label="Business revenue" value={formatCurrency(summary.totalIncome, currency)} change={incomePct} positiveIsGood />
+            <MetricCard label="Allowable expenses" value={formatCurrency(summary.deductibleExpenses, currency)} change={expensePct} positiveIsGood={false} />
+            <MetricCard label="Net profit / loss" value={formatCurrency(summary.netAllowablePosition, currency)} helper="Revenue minus allowable expenses" highlight={summary.netAllowablePosition >= 0 ? "good" : "bad"} />
           </div>
 
           {/* Action cards */}
@@ -191,8 +225,8 @@ export default function DashboardPage() {
           <div className="card">
             <div className="mb-5 flex items-start justify-between">
               <div>
-                <h2 className="text-lg font-bold text-stone-900" style={{ fontFamily: "Georgia, serif" }}>Income vs Expenses</h2>
-                <p className="text-sm muted">{now.getFullYear()} · Monthly overview</p>
+                <h2 className="text-lg font-bold text-stone-900" style={{ fontFamily: "Georgia, serif" }}>Revenue vs Allowable Expenses</h2>
+                <p className="text-sm muted">{now.getFullYear()} · Business transactions only</p>
               </div>
               <span className="rounded-lg border border-stone-200 px-3 py-1.5 text-xs text-stone-500" style={{ background: "#f9f7f3" }}>This year</span>
             </div>
@@ -227,8 +261,8 @@ export default function DashboardPage() {
                   ))}
                 </svg>
                 <div className="mt-3 flex gap-5 text-xs muted">
-                  <span className="flex items-center gap-1.5"><span className="inline-block h-2 w-2 rounded-full bg-teal-600" /> Income</span>
-                  <span className="flex items-center gap-1.5"><span className="inline-block h-2 w-2 rounded-full bg-red-600" /> Expenses</span>
+                  <span className="flex items-center gap-1.5"><span className="inline-block h-2 w-2 rounded-full bg-teal-600" /> Revenue</span>
+                  <span className="flex items-center gap-1.5"><span className="inline-block h-2 w-2 rounded-full bg-red-600" /> Allowable expenses</span>
                 </div>
               </>
             ) : (
@@ -253,7 +287,12 @@ export default function DashboardPage() {
                     </div>
                     <div className="min-w-0 flex-1">
                       <div className="truncate font-medium text-stone-900">{tx.description || tx.merchant || "Untitled"}</div>
-                      <div className="text-xs muted">{tx.transaction_date} · {tx.category || "Uncategorised"}</div>
+                      <div className="flex items-center gap-2 text-xs muted">
+                        <span>{tx.transaction_date} · {tx.category || "Uncategorised"}</span>
+                        <span className={`rounded-full px-2 py-0.5 font-medium ${tx.is_business !== false ? "bg-teal-50 text-teal-700" : "bg-fuchsia-50 text-fuchsia-700"}`}>
+                          {tx.is_business !== false ? "Business" : "Personal"}
+                        </span>
+                      </div>
                     </div>
                     <div className="flex shrink-0 items-center gap-2">
                       <span className={`font-semibold ${isIncome ? "text-teal-700" : "text-stone-800"}`}>

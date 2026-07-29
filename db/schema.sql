@@ -81,8 +81,10 @@ create table if not exists transactions (
   type text check (type in ('income','expense')) default 'expense',
   category text,
   payment_method text,
-  source text check (source in ('manual','bank_upload','voice','receipt')) default 'manual',
+  source text check (source in ('manual','bank_upload','bank_connection','voice','receipt')) default 'manual',
   notes text,
+  tags text[] not null default '{}',
+  is_business boolean not null default true,
   tax_deductible boolean default false,
   confidence_score numeric,
   ai_explanation text,
@@ -118,6 +120,74 @@ create table if not exists receipts (
   transaction_id uuid references transactions(id) on delete set null,
   created_at timestamptz default now()
 );
+
+-- Open Banking connections. Tokens are application-encrypted before storage.
+create table if not exists bank_connections (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references profiles(id) on delete cascade not null,
+  provider text not null default 'truelayer',
+  provider_name text,
+  access_token_encrypted text not null,
+  refresh_token_encrypted text,
+  expires_at timestamptz not null,
+  consent_expires_at timestamptz not null default (now() + interval '90 days'),
+  status text check (status in ('active','error','disconnected')) default 'active',
+  last_synced_at timestamptz,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+-- Auditable history for scheduled/manual bank synchronisation.
+create table if not exists sync_logs (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references profiles(id) on delete cascade not null,
+  connection_id uuid references bank_connections(id) on delete cascade,
+  status text not null check (status in ('running','success','failed')),
+  started_at timestamptz not null default now(),
+  finished_at timestamptz,
+  imported_count integer not null default 0,
+  duplicate_count integer not null default 0,
+  error_message text
+);
+
+create table if not exists bank_accounts (
+  id uuid primary key default gen_random_uuid(),
+  connection_id uuid references bank_connections(id) on delete cascade not null,
+  user_id uuid references profiles(id) on delete cascade not null,
+  provider_account_id text not null,
+  display_name text,
+  account_type text,
+  currency text default 'GBP',
+  account_number_masked text,
+  is_business boolean not null default false,
+  created_at timestamptz default now(),
+  unique(connection_id, provider_account_id)
+);
+
+alter table bank_connections add column if not exists consent_expires_at timestamptz not null default (now() + interval '90 days');
+alter table bank_accounts add column if not exists is_business boolean not null default false;
+
+alter table transactions add column if not exists external_transaction_id text;
+alter table transactions add column if not exists bank_account_id uuid references bank_accounts(id) on delete set null;
+alter table transactions add column if not exists provider_account_ref text;
+alter table transactions add column if not exists excluded_from_reports boolean not null default false;
+alter table transactions add column if not exists duplicate_of_id uuid references transactions(id) on delete set null;
+alter table transactions add column if not exists excluded_reason text;
+alter table transactions add column if not exists tags text[] not null default '{}';
+alter table transactions add column if not exists is_business boolean not null default true;
+alter table transactions add column if not exists reconciliation_key text;
+drop index if exists transactions_bank_external_unique;
+create unique index if not exists transactions_bank_account_external_unique on transactions(user_id, bank_account_id, external_transaction_id) where external_transaction_id is not null;
+create unique index if not exists transactions_reconciliation_unique on transactions(user_id, reconciliation_key) where reconciliation_key is not null;
+create index if not exists transactions_provider_external_idx on transactions(user_id, provider_account_ref, external_transaction_id) where external_transaction_id is not null;
+create index if not exists transactions_reporting_idx on transactions(user_id, excluded_from_reports, transaction_date desc);
+
+-- Give existing Open Banking rows a stable account identity across OAuth reconnects.
+update transactions t
+set provider_account_ref = 'truelayer:' || ba.provider_account_id
+from bank_accounts ba
+where t.bank_account_id = ba.id
+  and t.provider_account_ref is null;
 
 -- AI logs for categorisation / transcription
 create table if not exists ai_logs (
@@ -202,6 +272,18 @@ create policy "receipts_owner" on receipts for all using (
   exists (select 1 from uploads u where u.id = receipts.upload_id and u.user_id = auth.uid())
 );
 
+alter table bank_connections enable row level security;
+drop policy if exists "bank_connections_owner" on bank_connections;
+create policy "bank_connections_owner" on bank_connections for select using (user_id = auth.uid());
+
+alter table bank_accounts enable row level security;
+drop policy if exists "bank_accounts_owner" on bank_accounts;
+create policy "bank_accounts_owner" on bank_accounts for select using (user_id = auth.uid());
+
+alter table sync_logs enable row level security;
+drop policy if exists "sync_logs_owner" on sync_logs;
+create policy "sync_logs_owner" on sync_logs for select using (user_id = auth.uid());
+
 alter table ai_logs enable row level security;
 drop policy if exists "ai_logs_owner" on ai_logs;
 create policy "ai_logs_owner" on ai_logs for all using (user_id = auth.uid()) with check (user_id = auth.uid());
@@ -222,6 +304,8 @@ alter table transactions add column if not exists reimbursement_status text defa
 alter table transactions add column if not exists reimbursed_amount numeric;
 alter table transactions add column if not exists reimbursed_date date;
 alter table transactions add column if not exists reimbursement_notes text;
+alter table transactions drop constraint if exists transactions_source_check;
+alter table transactions add constraint transactions_source_check check (source in ('manual','bank_upload','bank_connection','voice','receipt'));
 
 -- Add check constraints if they don't already exist (safe to run multiple times via DO block)
 do $$ begin
@@ -338,7 +422,7 @@ create policy "tax_periods_owner" on tax_periods for all
 
 -- ── New table: transaction_audit_log ─────────────────────────────────────────
 -- Append-only. The log_transaction_changes() trigger writes here on every UPDATE
--- to category, amount_pence, tax_deductible, or user_confirmed. No user-facing
+-- to category, amount_pence, tax status, tax_deductible, or user_confirmed. No user-facing
 -- INSERT/UPDATE/DELETE is allowed (RLS blocks it; trigger uses SECURITY DEFINER).
 create table if not exists transaction_audit_log (
   id uuid primary key default gen_random_uuid(),
@@ -365,6 +449,12 @@ alter table businesses alter column business_type set default 'sole_trader';
 -- MTD enrolment flag. NINO/UTR are deferred to the OAuth/enrolment stage and
 -- MUST be encrypted at rest before being stored.
 alter table businesses add column if not exists mtd_enrolled boolean default false;
+
+-- Every code path assumes one business per owner (.maybeSingle() queries).
+-- Without this constraint, a client-side race can silently create duplicates:
+-- once >1 row exists, maybeSingle() errors, callers see data=null, and treat
+-- "no business" as license to insert yet another one, compounding forever.
+create unique index if not exists businesses_owner_id_unique on businesses(owner_id);
 
 -- ── Alter: transactions ───────────────────────────────────────────────────────
 -- DEPRECATED: amount (numeric/float). All new writes must use amount_pence instead.
@@ -410,9 +500,17 @@ begin
     insert into transaction_audit_log (transaction_id, user_id, field_name, old_value, new_value)
     values (old.id, auth.uid(), 'tax_deductible', old.tax_deductible::text, new.tax_deductible::text);
   end if;
+  if old.is_business is distinct from new.is_business then
+    insert into transaction_audit_log (transaction_id, user_id, field_name, old_value, new_value)
+    values (old.id, auth.uid(), 'is_business', old.is_business::text, new.is_business::text);
+  end if;
   if old.user_confirmed is distinct from new.user_confirmed then
     insert into transaction_audit_log (transaction_id, user_id, field_name, old_value, new_value)
     values (old.id, auth.uid(), 'user_confirmed', old.user_confirmed::text, new.user_confirmed::text);
+  end if;
+  if old.excluded_from_reports is distinct from new.excluded_from_reports then
+    insert into transaction_audit_log (transaction_id, user_id, field_name, old_value, new_value)
+    values (old.id, auth.uid(), 'excluded_from_reports', old.excluded_from_reports::text, new.excluded_from_reports::text);
   end if;
   return new;
 end;
@@ -455,5 +553,18 @@ where t.income_source_id is null
     where b.id = t.business_id
       and b.business_type in ('sole_trader', 'landlord')
   );
+
+-- Dashboard totals update immediately when transactions change.
+do $$
+begin
+  if exists (select 1 from pg_publication where pubname = 'supabase_realtime')
+     and not exists (
+       select 1 from pg_publication_tables
+       where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'transactions'
+     ) then
+    alter publication supabase_realtime add table public.transactions;
+  end if;
+end;
+$$;
 
 -- End of schema

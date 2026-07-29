@@ -64,7 +64,7 @@ export const VOICELEDGER_CATEGORIES = [
 
 export type VoiceLedgerCategory = (typeof VOICELEDGER_CATEGORIES)[number];
 export type TransactionType = "income" | "expense";
-export type TransactionSource = "manual" | "bank_upload" | "voice" | "receipt";
+export type TransactionSource = "manual" | "bank_upload" | "bank_connection" | "voice" | "receipt";
 export type PaymentSource = "business_account" | "personal_account" | "business_credit_card" | "personal_credit_card" | "cash" | "other";
 export type PaidBy = "company" | "director" | "owner" | "employee" | "contractor" | "other";
 export type ReimbursementStatus = "not_applicable" | "owed_to_director" | "reimbursed" | "partially_reimbursed";
@@ -108,9 +108,18 @@ export type TransactionRecord = {
   category: string | null;
   payment_method: string | null;
   source: TransactionSource;
+  bank_account_id: string | null;
+  provider_account_ref?: string | null;
+  external_transaction_id?: string | null;
+  is_business: boolean;
+  excluded_from_reports?: boolean;
+  duplicate_of_id?: string | null;
+  excluded_reason?: string | null;
+  tags: string[];
   notes: string | null;
   tax_deductible: boolean | null;
   confidence_score: number | string | null;
+  ai_explanation?: string | null;
   // Payment source fields
   payment_source: PaymentSource | null;
   paid_by: PaidBy | null;
@@ -126,6 +135,7 @@ export type TransactionRecord = {
   suggested_by_ai: boolean;
   user_confirmed: boolean;
   is_locked: boolean;
+  reconciliation_key?: string | null;
   created_at?: string | null;
 };
 
@@ -170,12 +180,14 @@ export function parseMoneyFromRecord(tx: { amount?: number | string | null; amou
 }
 
 export function summarizeTransactions(
-  transactions: Array<Pick<TransactionRecord, "amount" | "amount_pence" | "type" | "category" | "tax_deductible" | "user_confirmed">>,
+  transactions: Array<Pick<TransactionRecord, "amount" | "amount_pence" | "type" | "category" | "tax_deductible" | "user_confirmed"> & { is_business?: boolean; excluded_from_reports?: boolean }>,
   options: { confirmedOnly?: boolean } = {}
 ) {
   const { confirmedOnly = true } = options;
+  // Legacy rows without the flag pre-date personal tracking and remain business entries.
+  const businessTransactions = transactions.filter((tx) => tx.is_business !== false && tx.excluded_from_reports !== true);
   // When confirmedOnly, exclude AI-suggested transactions not yet reviewed by the user.
-  const eligible = confirmedOnly ? transactions.filter((tx) => tx.user_confirmed !== false) : transactions;
+  const eligible = confirmedOnly ? businessTransactions.filter((tx) => tx.user_confirmed !== false) : businessTransactions;
   const profitAndLossTransactions = eligible.filter((tx) => !isBalanceSheetCategory(tx.category));
   const totalIncome = profitAndLossTransactions.reduce((sum, tx) => {
     if (tx.type !== "income" || isRefundCategory(tx.category)) return sum;
@@ -196,15 +208,16 @@ export function summarizeTransactions(
   return {
     deductibleExpenses,
     estimatedProfit: totalIncome - totalExpenses,
+    netAllowablePosition: totalIncome - deductibleExpenses,
     totalExpenses,
     totalIncome,
     uncategorisedCount
   };
 }
 
-export function summarizeDirectorExpenses(transactions: Array<Pick<TransactionRecord, "amount" | "type" | "payment_source" | "director_reimbursable" | "reimbursement_status" | "reimbursed_amount">>) {
+export function summarizeDirectorExpenses(transactions: Array<Pick<TransactionRecord, "amount" | "type" | "payment_source" | "director_reimbursable" | "reimbursement_status" | "reimbursed_amount"> & { is_business?: boolean; excluded_from_reports?: boolean }>) {
   const personalExpenses = transactions.filter(
-    (tx) => tx.type === "expense" && isPersonalPaymentSource(tx.payment_source)
+    (tx) => tx.is_business !== false && tx.excluded_from_reports !== true && tx.type === "expense" && isPersonalPaymentSource(tx.payment_source)
   );
   const totalPaidPersonally = personalExpenses.reduce((sum, tx) => sum + parseMoney(tx.amount), 0);
   const outstanding = personalExpenses.reduce((sum, tx) => sum + computeOutstandingAmount(tx), 0);

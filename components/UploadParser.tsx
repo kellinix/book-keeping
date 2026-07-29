@@ -1,11 +1,12 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useToast } from "./Toast";
 
 type Preview = { rows: any[]; fields: string[]; upload?: { id?: string; key?: string } | null } | null;
 
 type AccountType = "business_account" | "personal_account" | "business_credit_card" | "personal_credit_card";
+type LinkedAccount = { id: string; display_name: string; currency: string; account_number_masked: string | null };
 
 const ACCOUNT_TYPE_OPTIONS: { value: AccountType; label: string; warning?: string }[] = [
   { value: "business_account", label: "Business bank account" },
@@ -47,12 +48,20 @@ export default function UploadParser({ onImported }: { onImported?: () => void }
   const [loading, setLoading] = useState(false);
   const [mapping, setMapping] = useState<Record<string, string>>({});
   const [accountType, setAccountType] = useState<AccountType>("business_account");
+  const [isBusiness, setIsBusiness] = useState(true);
+  const [linkedAccounts, setLinkedAccounts] = useState<LinkedAccount[]>([]);
+  const [bankAccountId, setBankAccountId] = useState("");
+
+  useEffect(() => {
+    import("../lib/supabaseClient").then(({ supabase }) => supabase.from("bank_accounts").select("id,display_name,currency,account_number_masked").order("display_name")).then(({ data }) => setLinkedAccounts((data ?? []) as LinkedAccount[]));
+  }, []);
 
   const handleFile = (f: File | null) => {
     setFile(f);
     setPreview(null);
     setMapping({});
     if (!f) return;
+    if (f.size > 25 * 1024 * 1024) { toast("File must be 25 MB or smaller", "error"); return; }
     const fd = new FormData();
     fd.append("file", f);
     setLoading(true);
@@ -64,13 +73,14 @@ export default function UploadParser({ onImported }: { onImported?: () => void }
       })
       .then((r) => r.json())
       .then((data) => {
+        if (data.error) throw new Error(data.error);
         const fields = data.fields ?? [];
         setPreview({ rows: data.rows ?? [], fields, upload: data.upload ?? null });
         const m: Record<string, string> = {};
         for (const fName of fields) m[fName] = inferFieldMapping(fName.toLowerCase().trim());
         setMapping(m);
       })
-      .catch((e) => console.error(e))
+      .catch((e) => toast(e instanceof Error ? e.message : "Could not preview file", "error"))
       .finally(() => setLoading(false));
   };
 
@@ -102,7 +112,7 @@ export default function UploadParser({ onImported }: { onImported?: () => void }
     const res = await fetch("/api/uploads/import", {
       method: "POST",
       headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-      body: JSON.stringify({ rows: mappedRows, accountType })
+      body: JSON.stringify({ rows: mappedRows, accountType, bankAccountId: bankAccountId || null, isBusiness })
     });
     const data = await res.json();
     setLoading(false);
@@ -130,7 +140,30 @@ export default function UploadParser({ onImported }: { onImported?: () => void }
     <div className="card">
       <div className="mb-3">
         <h2 className="text-lg font-semibold">Bank statement import</h2>
-        <p className="text-sm muted">CSV and XLSX are supported. Preview before importing.</p>
+        <p className="text-sm muted">CSV and XLSX up to 25 MB are supported. Preview and map columns before importing.</p>
+      </div>
+
+      {linkedAccounts.length > 0 && (
+        <label className="mb-3 block text-sm font-medium">
+          Match to a linked account (optional)
+          <select value={bankAccountId} onChange={(e) => setBankAccountId(e.target.value)} className="mt-1 w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-stone-900">
+            <option value="">No linked account</option>
+            {linkedAccounts.map((account) => <option key={account.id} value={account.id}>{account.display_name}{account.account_number_masked ? ` ${account.account_number_masked}` : ""} · {account.currency}</option>)}
+          </select>
+        </label>
+      )}
+
+      <div className="mb-3 rounded-xl border border-stone-200 bg-stone-50 p-3">
+        <div className="text-sm font-medium text-stone-800">Transaction use</div>
+        <div className="mt-2 grid grid-cols-2 gap-2">
+          <button type="button" onClick={() => setIsBusiness(true)} className={`rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${isBusiness ? "bg-teal-600 text-white" : "bg-white text-stone-600 hover:bg-stone-100"}`}>
+            Business
+          </button>
+          <button type="button" onClick={() => setIsBusiness(false)} className={`rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${!isBusiness ? "bg-fuchsia-600 text-white" : "bg-white text-stone-600 hover:bg-stone-100"}`}>
+            Personal
+          </button>
+        </div>
+        <p className="mt-2 text-xs text-stone-500">This status applies to every transaction in this import and can be changed later in the ledger.</p>
       </div>
 
       <div className="mb-3">
@@ -152,10 +185,16 @@ export default function UploadParser({ onImported }: { onImported?: () => void }
         </div>
       </div>
 
-      {isPersonalAccount && (
+      {isPersonalAccount && isBusiness && (
         <div className="mb-3 rounded border border-amber-800 bg-amber-950/40 p-3 text-sm text-amber-200">
           <p className="font-medium">Personal account selected</p>
           <p className="mt-1 text-amber-300/80">Imported business expense transactions will be marked as director paid and tracked for reimbursement. Only import transactions that are genuinely business-related. Personal spending should not be recorded as business expenses.</p>
+        </div>
+      )}
+
+      {!isBusiness && (
+        <div className="mb-3 rounded border border-fuchsia-200 bg-fuchsia-50 p-3 text-sm text-fuchsia-700">
+          Personal transactions are kept in the ledger but excluded from business reports, allowable expenses, tax estimates, and tax CSV exports.
         </div>
       )}
 

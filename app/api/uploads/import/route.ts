@@ -3,6 +3,8 @@ import { getUserFromAuthHeader } from "../../../../lib/auth";
 import { ensureProfileForUser } from "../../../../lib/profiles";
 import { supabaseAdmin } from "../../../../lib/supabaseAdmin";
 import { normalizeCategory, parseMoney } from "../../../../lib/voiceledger";
+import { reconciliationKey } from "../../../../lib/reconciliation";
+import { trueLayerAccountRef } from "../../../../lib/truelayer";
 
 function normalizeStatementDate(value: unknown) {
   if (value === null || value === undefined || value === "") return null;
@@ -60,7 +62,8 @@ function inferCategory(row: any, amount: number) {
 
 export async function POST(req: Request) {
   const body = await req.json();
-  const { rows, accountType } = body || {};
+  const { rows, accountType, bankAccountId } = body || {};
+  const isBusiness = body?.isBusiness !== false;
   if (!rows || !Array.isArray(rows)) return NextResponse.json({ error: "Invalid rows" }, { status: 400 });
 
   const authHeader = req.headers.get('authorization');
@@ -68,6 +71,13 @@ export async function POST(req: Request) {
   const user_id = user?.id ?? null;
   if (!user_id) return NextResponse.json({ error: 'Unauthorized: missing or invalid bearer token' }, { status: 401 });
   await ensureProfileForUser(user);
+
+  let providerAccountRef: string | null = null;
+  if (bankAccountId) {
+    const { data: account } = await supabaseAdmin.from("bank_accounts").select("id,provider_account_id").eq("id", bankAccountId).eq("user_id", user_id).maybeSingle();
+    if (!account) return NextResponse.json({ error: "Invalid account source" }, { status: 403 });
+    providerAccountRef = trueLayerAccountRef(account.provider_account_id);
+  }
 
   // Determine payment source from account type selection
   const validAccountTypes = ["business_account", "personal_account", "business_credit_card", "personal_credit_card"];
@@ -82,14 +92,19 @@ export async function POST(req: Request) {
     const outAmt = r["Money Out"] || r["Debit"] || r.Debit || r["Amount Out"];
     const amount = inAmt ? parseMoney(inAmt) : outAmt ? -Math.abs(parseMoney(outAmt)) : parseMoney(r.Amount || r.amount || 0);
     const txType = Number(amount) < 0 ? "expense" : "income";
-    const directorReimbursable = isPersonalAccount && txType === "expense";
+    const directorReimbursable = isBusiness && isPersonalAccount && txType === "expense";
 
-    return {
+    const transaction = {
       amount: Math.abs(Number(amount)),
+      amount_pence: Math.round(Math.abs(Number(amount)) * 100),
       category: inferCategory(r, amount),
+      bank_account_id: bankAccountId || null,
+      provider_account_ref: providerAccountRef,
       confidence_score: r.confidence_score ? Number(r.confidence_score) : null,
       currency: String(r.Currency || r.currency || "GBP").slice(0, 3).toUpperCase(),
       description: desc,
+      is_business: isBusiness,
+      tags: [],
       director_reimbursable: directorReimbursable,
       merchant: r.Merchant || r.merchant || r.Name || null,
       notes: r.Reference || r.reference || r["Notes and #tags"] || null,
@@ -97,24 +112,28 @@ export async function POST(req: Request) {
       payment_source: resolvedAccountType,
       reimbursement_status: directorReimbursable ? "owed_to_director" : "not_applicable",
       source: "bank_upload",
-      tax_deductible: Boolean(r.tax_deductible),
+      suggested_by_ai: false,
+      tax_deductible: isBusiness && Boolean(r.tax_deductible),
       transaction_date: date,
       type: txType,
+      user_confirmed: true,
       user_id
     };
+    return { ...transaction, reconciliation_key: reconciliationKey(transaction) };
   }).filter((tx: any) => tx.transaction_date && tx.description && tx.amount > 0);
 
   if (!mapped.length) return NextResponse.json({ error: "No valid rows to import" }, { status: 400 });
 
+  const keys = mapped.map((tx: any) => tx.reconciliation_key).filter(Boolean);
   const { data: existing } = await supabaseAdmin
     .from("transactions")
-    .select("transaction_date,description,amount,type")
+    .select("reconciliation_key")
     .eq("user_id", user_id)
-    .in("transaction_date", Array.from(new Set(mapped.map((tx: any) => tx.transaction_date))));
+    .in("reconciliation_key", keys);
 
-  const seen = new Set((existing ?? []).map((tx: any) => `${tx.transaction_date}|${tx.description}|${Number(tx.amount).toFixed(2)}|${tx.type}`));
+  const seen = new Set((existing ?? []).map((tx: any) => tx.reconciliation_key));
   const deduped = mapped.filter((tx: any) => {
-    const key = `${tx.transaction_date}|${tx.description}|${Number(tx.amount).toFixed(2)}|${tx.type}`;
+    const key = tx.reconciliation_key;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;

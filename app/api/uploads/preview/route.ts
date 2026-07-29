@@ -12,13 +12,17 @@ const ALLOWED_TYPES = new Set([
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 ]);
 
-const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 
 export async function POST(req: Request) {
+  const user = await getUserFromAuthHeader(req.headers.get("authorization"));
+  const userId = user?.id ?? null;
+  if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  await ensureProfileForUser(user);
   const form = await req.formData();
   const file = form.get("file") as unknown as File;
   if (!file) return NextResponse.json({ error: "No file provided" }, { status: 400 });
-  if (file.size > MAX_UPLOAD_BYTES) return NextResponse.json({ error: "File is too large. Maximum size is 10MB." }, { status: 400 });
+  if (file.size > MAX_UPLOAD_BYTES) return NextResponse.json({ error: "File is too large. Maximum size is 25 MB." }, { status: 413 });
 
   const name = file.name || "upload";
   const lowerName = name.toLowerCase();
@@ -29,12 +33,9 @@ export async function POST(req: Request) {
 
   const arrayBuffer = await file.arrayBuffer();
   const buffer = Buffer.from(arrayBuffer);
-  const user = await getUserFromAuthHeader(req.headers.get("authorization"));
-  const userId = user?.id ?? null;
   let upload: { id?: string; key?: string } | null = null;
 
   if (userId) {
-    await ensureProfileForUser(user);
     const key = `bank-statements/${userId}/${Date.now()}-${name.replace(/[^A-Za-z0-9._-]/g, "_")}`;
     const { error: storageError } = await supabaseAdmin.storage.from("uploads").upload(key, buffer, {
       contentType: file.type || "application/octet-stream",
@@ -54,7 +55,7 @@ export async function POST(req: Request) {
     const text = buffer.toString("utf-8");
     const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
     if (parsed.errors.length) return NextResponse.json({ error: parsed.errors[0]?.message ?? "Unable to parse CSV" }, { status: 400 });
-    return NextResponse.json({ rows: parsed.data.slice(0, 100), fields: parsed.meta.fields ?? [], upload });
+    return NextResponse.json({ rows: parsed.data.slice(0, 1000), fields: parsed.meta.fields ?? [], upload });
   }
 
   // Try XLSX
@@ -63,7 +64,7 @@ export async function POST(req: Request) {
     const sheetName = workbook.SheetNames[0];
     const worksheet = workbook.Sheets[sheetName];
     const json = XLSX.utils.sheet_to_json(worksheet, { raw: false });
-    return NextResponse.json({ rows: json.slice(0, 100), fields: Object.keys(json[0] ?? {}), upload });
+    return NextResponse.json({ rows: json.slice(0, 1000), fields: Object.keys(json[0] ?? {}), upload });
   } catch (err) {
     return NextResponse.json({ error: "Unable to parse file" }, { status: 400 });
   }

@@ -5,6 +5,8 @@ import { supabase } from "../../../lib/supabaseClient";
 import { useToast } from "../../../components/Toast";
 import { VOICELEDGER_CATEGORIES } from "../../../lib/voiceledger";
 import type { IncomeSource } from "../../../lib/voiceledger";
+import BankConnections from "../../../components/BankConnections";
+import { getOrCreateBusiness } from "../../../lib/business";
 
 const INPUT = "mt-1 w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 focus:outline-none focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500";
 
@@ -31,8 +33,8 @@ export default function SettingsPage() {
     const user = (await supabase.auth.getUser()).data.user;
     if (!user) { setLoading(false); return; }
 
-    const { data } = await supabase.from("businesses").select("*").eq("owner_id", user.id).maybeSingle();
-    if (data) {
+    try {
+      const data = await getOrCreateBusiness(user.id, user.email);
       setBusiness(data);
       setName(data.name ?? "");
       setBusinessType(data.business_type ?? "sole_trader");
@@ -41,13 +43,13 @@ export default function SettingsPage() {
       setTaxYearStart(data.tax_year_start ?? "");
       setTaxYearEnd(data.tax_year_end ?? "");
       setExportFormat(data.export_preferences?.format ?? "csv");
-    }
 
-    if (data?.id) {
       const { data: categoryRows } = await supabase.from("categories").select("name").eq("business_id", data.id).order("name");
       if (categoryRows?.length) setCategories(categoryRows.map((row) => row.name).join("\n"));
       const { data: sourceRows } = await supabase.from("income_sources").select("*").eq("business_id", data.id).order("created_at");
       if (sourceRows) setIncomeSources(sourceRows as IncomeSource[]);
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "Could not load your business settings", "error");
     }
 
     setLoading(false);
@@ -118,6 +120,7 @@ export default function SettingsPage() {
 
       {loading ? <div className="card muted">Loading...</div> : (
         <div className="grid gap-6 lg:grid-cols-2">
+          <BankConnections />
           <section className="card space-y-4">
             <h2 className="font-semibold text-stone-900">Business profile</h2>
             <label className="block text-sm font-medium text-stone-700">

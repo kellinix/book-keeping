@@ -3,19 +3,28 @@
 import { useEffect, useMemo, useState } from "react";
 import { useToast } from "../../../components/Toast";
 import ReceiptUploader from "../../../components/ReceiptUploader";
+import ReceiptScanner, { ReceiptDraft } from "../../../components/ReceiptScanner";
 import TransactionForm from "../../../components/TransactionForm";
 import UploadParser from "../../../components/UploadParser";
 import VoiceRecorder from "../../../components/VoiceRecorder";
 import { supabase } from "../../../lib/supabaseClient";
-import { computeOutstandingAmount, formatCurrency, PAYMENT_SOURCE_LABELS, REIMBURSEMENT_STATUS_LABELS, TransactionRecord, VOICELEDGER_CATEGORIES } from "../../../lib/voiceledger";
+import { computeOutstandingAmount, formatCurrency, PAYMENT_SOURCE_LABELS, REIMBURSEMENT_STATUS_LABELS, TransactionRecord, TransactionSource, VOICELEDGER_CATEGORIES } from "../../../lib/voiceledger";
+import { fetchAllTransactions } from "../../../lib/transactionQueries";
 
-type Filters = { category: string; source: string; type: string; query: string; };
+type Filters = { category: string; source: string; status: string; type: string; query: string; };
 type ReimbursementFormState = { txId: string; originalAmount: number; alreadyReimbursed: number; currency: string; reimbursedAmount: string; reimbursedDate: string; notes: string; };
 type EditFormState = { txId: string; description: string; };
-type AddTab = "manual" | "voice" | "import";
+type AddTab = "manual" | "receipt" | "voice" | "import";
 
 const INPUT = "w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 focus:outline-none focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500";
 const SELECT = "rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 focus:outline-none focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500";
+const SOURCE_BADGES: Record<TransactionSource, { label: string; className: string }> = {
+  bank_connection: { label: "Open Banking Sync", className: "bg-sky-50 text-sky-700" },
+  bank_upload: { label: "Bank Statement", className: "bg-violet-50 text-violet-700" },
+  manual: { label: "Manual", className: "bg-stone-100 text-stone-700" },
+  receipt: { label: "Receipt Upload", className: "bg-amber-50 text-amber-700" },
+  voice: { label: "Voice AI", className: "bg-teal-50 text-teal-700" }
+};
 
 function IconEdit() {
   return (
@@ -47,24 +56,25 @@ export default function TransactionsPage() {
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkCategory, setBulkCategory] = useState("Software");
-  const [filters, setFilters] = useState<Filters>({ category: "", query: "", source: "", type: "" });
+  const [filters, setFilters] = useState<Filters>({ category: "", query: "", source: "", status: "", type: "" });
   const [reimbursementForm, setReimbursementForm] = useState<ReimbursementFormState | null>(null);
   const [editForm, setEditForm] = useState<EditFormState | null>(null);
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [addTab, setAddTab] = useState<AddTab>("manual");
   const [receiptOpenId, setReceiptOpenId] = useState<string | null>(null);
+  const [receiptDraft, setReceiptDraft] = useState<ReceiptDraft | null>(null);
 
   const load = async () => {
     setLoading(true);
     const user = (await supabase.auth.getUser()).data.user;
     if (!user) { setTransactions([]); setLoading(false); return; }
-    const { data, error } = await supabase.from("transactions").select("*").eq("user_id", user.id).order("transaction_date", { ascending: false }).limit(500);
-    if (error) {
+    try {
+      const data = await fetchAllTransactions(user.id);
+      setTransactions(data);
+    } catch (error) {
       // eslint-disable-next-line no-console
       console.error(error);
-    } else {
-      setTransactions((data ?? []) as TransactionRecord[]);
     }
     setLoading(false);
   };
@@ -76,6 +86,9 @@ export default function TransactionsPage() {
     return transactions.filter((tx) => {
       if (filters.type && tx.type !== filters.type) return false;
       if (filters.source && tx.source !== filters.source) return false;
+      if (filters.status === "business" && tx.is_business === false) return false;
+      if (filters.status === "personal" && tx.is_business !== false) return false;
+      if (filters.status === "review" && tx.user_confirmed !== false) return false;
       if (filters.category && (tx.category || "Uncategorised") !== filters.category) return false;
       if (!query) return true;
       return [tx.description, tx.merchant, tx.category, tx.notes, tx.payment_method].some((v) => String(v ?? "").toLowerCase().includes(query));
@@ -156,7 +169,7 @@ export default function TransactionsPage() {
 
   const handleAdded = () => { load(); setAddOpen(false); };
   const categories = Array.from(new Set(transactions.map((tx) => tx.category || "Uncategorised"))).sort();
-  const TAB_LABELS: Record<AddTab, string> = { manual: "Manual", voice: "Voice note", import: "Bank import" };
+  const TAB_LABELS: Record<AddTab, string> = { manual: "Manual", receipt: "Receipt", voice: "Voice note", import: "Bank import" };
 
   return (
     <div className="space-y-5">
@@ -178,7 +191,7 @@ export default function TransactionsPage() {
           <div className="w-full max-w-lg rounded-2xl border bg-white shadow-2xl" style={{ borderColor: "var(--border)" }}>
             <div className="flex items-center justify-between border-b px-5 py-4" style={{ borderColor: "var(--border)" }}>
               <div className="flex gap-1">
-                {(["manual", "voice", "import"] as AddTab[]).map((tab) => (
+                {(["manual", "receipt", "voice", "import"] as AddTab[]).map((tab) => (
                   <button key={tab} onClick={() => setAddTab(tab)}
                     className={`rounded-lg px-4 py-2 text-sm font-medium transition-colors ${addTab === tab ? "bg-stone-100 text-stone-900" : "text-stone-500 hover:text-stone-900"}`}>
                     {TAB_LABELS[tab]}
@@ -191,6 +204,7 @@ export default function TransactionsPage() {
             </div>
             <div className="p-5">
               {addTab === "manual" && <TransactionForm onSaved={handleAdded} />}
+              {addTab === "receipt" && (receiptDraft ? <div className="space-y-4"><button className="text-sm text-teal-700 hover:underline" onClick={() => setReceiptDraft(null)}>← Scan a different receipt</button><TransactionForm initial={{ amount: receiptDraft.total ?? undefined, category: receiptDraft.category, currency: receiptDraft.currency, date: receiptDraft.date, description: receiptDraft.description, merchant: receiptDraft.merchant, taxDeductible: receiptDraft.tax_deductible, uploadId: receiptDraft.uploadId, isBusiness: receiptDraft.is_business, type: receiptDraft.type }} onSaved={() => { setReceiptDraft(null); handleAdded(); }} /></div> : <ReceiptScanner onRead={setReceiptDraft} />)}
               {addTab === "voice" && <VoiceRecorder onSaved={handleAdded} />}
               {addTab === "import" && <UploadParser onImported={handleAdded} />}
             </div>
@@ -277,6 +291,7 @@ export default function TransactionsPage() {
             <option value="">All sources</option>
             <option value="manual">Manual</option>
             <option value="bank_upload">Bank upload</option>
+            <option value="bank_connection">Connected bank</option>
             <option value="voice">Voice</option>
             <option value="receipt">Receipt</option>
           </select>
@@ -284,12 +299,23 @@ export default function TransactionsPage() {
             <option value="">All categories</option>
             {categories.map((cat) => <option key={cat} value={cat}>{cat}</option>)}
           </select>
+          <select value={filters.status} onChange={(e) => setFilters((c) => ({ ...c, status: e.target.value }))} className={SELECT}>
+            <option value="">Business + personal</option>
+            <option value="business">Business only</option>
+            <option value="personal">Personal only</option>
+            <option value="review">Needs review</option>
+          </select>
           <div className="flex gap-2 lg:col-span-2">
             <select value={bulkCategory} onChange={(e) => setBulkCategory(e.target.value)} className={`${SELECT} min-w-0 flex-1`}>
               {VOICELEDGER_CATEGORIES.map((cat) => <option key={cat} value={cat}>{cat}</option>)}
             </select>
             <button onClick={() => bulkUpdate({ category: bulkCategory })} disabled={!selectedRows.length} className="btn border border-stone-300 text-stone-700 hover:bg-stone-50 disabled:opacity-40">Bulk categorise</button>
-            <button onClick={() => bulkUpdate({ tax_deductible: true })} disabled={!selectedRows.length} className="btn border border-stone-300 text-stone-700 hover:bg-stone-50 disabled:opacity-40">Mark deductible</button>
+            <button onClick={() => bulkUpdate({ tax_deductible: true, user_confirmed: true })} disabled={!selectedRows.length} className="btn border border-stone-300 text-stone-700 hover:bg-stone-50 disabled:opacity-40">Mark deductible</button>
+          </div>
+          <div className="flex gap-2">
+            <button onClick={() => bulkUpdate({ is_business: true, user_confirmed: true })} disabled={!selectedRows.length} className="btn border border-teal-200 text-teal-700 hover:bg-teal-50 disabled:opacity-40">Mark business</button>
+            <button onClick={() => bulkUpdate({ is_business: false, user_confirmed: true })} disabled={!selectedRows.length} className="btn border border-fuchsia-200 text-fuchsia-700 hover:bg-fuchsia-50 disabled:opacity-40">Mark personal</button>
+            <button onClick={() => bulkUpdate({ user_confirmed: true })} disabled={!selectedRows.length} className="btn border border-sky-200 text-sky-700 hover:bg-sky-50 disabled:opacity-40">Confirm</button>
           </div>
         </div>
       </section>
@@ -312,7 +338,7 @@ export default function TransactionsPage() {
               <thead style={{ background: "#f9f7f3" }}>
                 <tr className="text-left">
                   <th className="p-3 pl-5"><input checked={filtered.length > 0 && selectedRows.length === filtered.length} onChange={(e) => setSelected(e.target.checked ? new Set(filtered.map((tx) => tx.id)) : new Set())} type="checkbox" /></th>
-                  {["Date", "Description", "Type", "Category", "Amount", "Source", "Paid from", "Reimbursement", "Deductible", "Actions"].map((h) => (
+                  {["Date", "Description", "Type", "Category", "Amount", "Source", "Tax status", "Paid from", "Reimbursement", "Deductible", "Actions"].map((h) => (
                     <th key={h} className="p-3 text-xs font-semibold uppercase tracking-wide text-stone-500">{h}</th>
                   ))}
                 </tr>
@@ -337,6 +363,12 @@ export default function TransactionsPage() {
                       <td className="max-w-[200px] p-3">
                         <div className="font-medium text-stone-900">{tx.description || "Untitled"}</div>
                         {(tx.merchant || tx.notes) && <div className="text-xs muted truncate">{tx.merchant || tx.notes}</div>}
+                        {tx.source === "bank_connection" && Number(tx.confidence_score || 0) > 0 && (
+                          <span title={tx.ai_explanation || "Automatic category match"} className={`mt-1 inline-flex rounded-md px-2 py-0.5 text-[11px] font-medium ${Number(tx.confidence_score) >= 0.92 ? "bg-sky-50 text-sky-700" : "bg-amber-50 text-amber-700"}`}>
+                            Auto-category {Math.round(Number(tx.confidence_score) * 100)}%
+                          </span>
+                        )}
+                        {tx.user_confirmed === false && <span className="mt-1 inline-flex rounded-md bg-amber-50 px-2 py-0.5 text-[11px] font-semibold text-amber-700">Needs review · excluded from reports</span>}
                       </td>
                       <td className="p-3">
                         <span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-semibold ${tx.type === "income" ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-rose-700"}`}>
@@ -344,7 +376,7 @@ export default function TransactionsPage() {
                         </span>
                       </td>
                       <td className="p-3">
-                        <select value={tx.category || "Other"} onChange={(e) => updateTransaction(tx.id, { category: e.target.value })}
+                        <select value={tx.category || "Other"} onChange={(e) => updateTransaction(tx.id, { category: e.target.value, user_confirmed: true })}
                           className="rounded-lg border border-stone-200 bg-white px-2 py-1 text-xs text-stone-800 focus:outline-none focus:border-teal-500">
                           {VOICELEDGER_CATEGORIES.map((cat) => <option key={cat} value={cat}>{cat}</option>)}
                         </select>
@@ -354,8 +386,18 @@ export default function TransactionsPage() {
                       </td>
                       <td className="p-3">
                         {tx.source ? (
-                          <span className="rounded-md bg-stone-100 px-2 py-0.5 text-xs text-stone-600">{tx.source}</span>
+                          <span className={`rounded-md px-2 py-0.5 text-xs font-medium ${SOURCE_BADGES[tx.source].className}`}>{SOURCE_BADGES[tx.source].label}</span>
                         ) : <span className="muted">—</span>}
+                      </td>
+                      <td className="p-3">
+                        <button
+                          type="button"
+                          onClick={() => updateTransaction(tx.id, { is_business: tx.is_business === false, user_confirmed: true })}
+                          aria-label={`Mark ${tx.description || "transaction"} as ${tx.is_business !== false ? "personal" : "business"}`}
+                          className={`rounded-full px-2.5 py-1 text-xs font-semibold transition-colors ${tx.is_business !== false ? "bg-teal-50 text-teal-700 hover:bg-teal-100" : "bg-fuchsia-50 text-fuchsia-700 hover:bg-fuchsia-100"}`}
+                        >
+                          {tx.is_business !== false ? "Business" : "Personal"}
+                        </button>
                       </td>
                       <td className="p-3 text-xs text-stone-600">
                         {isPersonal ? (
@@ -375,8 +417,9 @@ export default function TransactionsPage() {
                         ) : <span className="text-stone-400">—</span>}
                       </td>
                       <td className="p-3">
-                        <input checked={Boolean(tx.tax_deductible)} onChange={(e) => updateTransaction(tx.id, { tax_deductible: e.target.checked })} type="checkbox"
-                          className="h-4 w-4 rounded border-stone-300 text-teal-600 focus:ring-teal-500" />
+                        <input checked={tx.is_business !== false && Boolean(tx.tax_deductible)} disabled={tx.is_business === false} onChange={(e) => updateTransaction(tx.id, { tax_deductible: e.target.checked, user_confirmed: true })} type="checkbox"
+                          title={tx.is_business === false ? "Personal transactions cannot be allowable expenses" : "Mark as allowable expense"}
+                          className="h-4 w-4 rounded border-stone-300 text-teal-600 focus:ring-teal-500 disabled:cursor-not-allowed disabled:opacity-40" />
                       </td>
                       <td className="p-3">
                         <div className="flex flex-wrap gap-1.5">
@@ -412,7 +455,7 @@ export default function TransactionsPage() {
                   );
                 })}
                 {!filtered.length && (
-                  <tr><td className="p-5 muted" colSpan={11}>No transactions match these filters.</td></tr>
+                  <tr><td className="p-5 muted" colSpan={12}>No transactions match these filters.</td></tr>
                 )}
               </tbody>
             </table>

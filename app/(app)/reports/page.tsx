@@ -3,8 +3,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { supabase } from "../../../lib/supabaseClient";
 import { useToast } from "../../../components/Toast";
-import { computeOutstandingAmount, isBalanceSheetCategory, isRefundCategory, PAYMENT_SOURCE_LABELS, REIMBURSEMENT_STATUS_LABELS, summarizeDirectorExpenses, summarizeTransactions } from "../../../lib/voiceledger";
+import { computeOutstandingAmount, parseMoneyFromRecord, PAYMENT_SOURCE_LABELS, REIMBURSEMENT_STATUS_LABELS, summarizeDirectorExpenses, summarizeTransactions } from "../../../lib/voiceledger";
 import { estimateIncomeTax, IT_BANDS } from "../../../lib/income-tax-bands";
+import { fetchAllTransactions } from "../../../lib/transactionQueries";
+import { getOrCreateBusiness } from "../../../lib/business";
 
 function fmtCurrency(amount: number, currency = "GBP") {
   try { return new Intl.NumberFormat(undefined, { style: "currency", currency }).format(amount); }
@@ -14,7 +16,7 @@ function fmtCurrency(amount: number, currency = "GBP") {
 const CAT_COLORS = ["#0d9488", "#92400e", "#7c3aed", "#0369a1", "#d97706", "#dc2626"];
 
 function downloadCSV(csv: string, filename: string) {
-  const blob = new Blob([csv], { type: "text/csv" });
+  const blob = new Blob(["\uFEFF", csv], { type: "text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url; a.download = filename;
@@ -35,28 +37,27 @@ export default function ReportsPage() {
       const user = (await supabase.auth.getUser()).data.user;
       if (!user) { setLoading(false); return; }
 
-      const { data: biz } = await supabase.from("businesses").select("*").eq("owner_id", user.id).maybeSingle();
-      let currentBiz = biz;
-      if (!currentBiz) {
-        const { data: inserted } = await supabase.from("businesses").insert({ owner_id: user.id, name: `${user.email ?? "My"} Business`, base_currency: "GBP", corporation_tax_rate: 25 }).select().single();
-        currentBiz = inserted;
-      }
-      if (!mounted) return;
-      setBusiness(currentBiz);
+      try {
+        const currentBiz = await getOrCreateBusiness(user.id, user.email);
+        if (!mounted) return;
+        setBusiness(currentBiz);
 
-      const { data: txs } = await supabase.from("transactions").select("*").eq("user_id", user.id);
-      if (!mounted) return;
-      setTransactions(txs ?? []);
+        const txs = await fetchAllTransactions(user.id);
+        if (!mounted) return;
+        setTransactions(txs);
+      } catch (error) {
+        toast(error instanceof Error ? error.message : "Could not load the report", "error");
+      }
       setLoading(false);
     };
     load();
     return () => { mounted = false; };
-  }, []);
+  }, [toast]);
 
   const summary = useMemo(() => summarizeTransactions(transactions), [transactions]);
   const directorSummary = useMemo(() => summarizeDirectorExpenses(transactions), [transactions]);
   const directorTransactions = useMemo(() =>
-    transactions.filter(t => t.type === "expense" && (t.payment_source === "personal_account" || t.payment_source === "personal_credit_card"))
+    transactions.filter(t => t.is_business !== false && t.user_confirmed !== false && t.type === "expense" && (t.payment_source === "personal_account" || t.payment_source === "personal_credit_card"))
       .sort((a, b) => (b.transaction_date ?? "").localeCompare(a.transaction_date ?? "")),
     [transactions]
   );
@@ -74,23 +75,17 @@ export default function ReportsPage() {
         const td = new Date(raw);
         return !isNaN(td.getTime()) && `${td.getFullYear()}-${String(td.getMonth() + 1).padStart(2, "0")}` === key;
       });
-      let income = 0, expense = 0;
-      for (const t of mTxs) {
-        if (isBalanceSheetCategory(t.category)) continue;
-        if (t.type === "income" && isRefundCategory(t.category)) expense = Math.max(0, expense - Number(t.amount || 0));
-        else if (t.type === "income") income += Number(t.amount || 0);
-        else expense += Number(t.amount || 0);
-      }
-      return { key, label, income, expense };
+      const monthSummary = summarizeTransactions(mTxs);
+      return { key, label, income: monthSummary.totalIncome, expense: monthSummary.deductibleExpenses };
     });
   }, [transactions]);
 
   const topCategories = useMemo(() => {
     const map: Record<string, number> = {};
     for (const t of transactions) {
-      if (t.type !== "expense" || isBalanceSheetCategory(t.category)) continue;
+      if (t.is_business === false || t.user_confirmed === false || t.type !== "expense" || !t.tax_deductible) continue;
       const cat = t.category || "Uncategorised";
-      map[cat] = (map[cat] || 0) + Number(t.amount || 0);
+      map[cat] = (map[cat] || 0) + parseMoneyFromRecord(t);
     }
     return Object.entries(map).sort((a, b) => b[1] - a[1]).slice(0, 6);
   }, [transactions]);
@@ -98,8 +93,8 @@ export default function ReportsPage() {
   const corpRate = Number(business?.corporation_tax_rate ?? 25);
   const isSoleTrader = business?.business_type === "sole_trader" || business?.business_type === "freelancer";
   const estimatedTax = isSoleTrader
-    ? estimateIncomeTax(Math.max(0, summary.estimatedProfit))
-    : Math.max(0, summary.estimatedProfit) * (corpRate / 100);
+    ? estimateIncomeTax(Math.max(0, summary.netAllowablePosition))
+    : Math.max(0, summary.netAllowablePosition) * (corpRate / 100);
   const baseCurrency = business?.base_currency ?? "GBP";
 
   // Chart dimensions
@@ -115,11 +110,42 @@ export default function ReportsPage() {
   const xOf = (i: number) => PAD.left + i * mW + mW / 2;
 
   const exportCSV = () => {
-    if (!transactions.length) { toast("No transactions to export", "info"); return; }
-    const headers = ["id", "transaction_date", "description", "merchant", "amount", "currency", "type", "category", "payment_source", "source", "notes", "tax_deductible", "reimbursement_status", "reimbursed_amount"];
-    const rows = transactions.map(t => headers.map(h => { const v = t[h]; if (v == null) return ""; return `"${String(v).replace(/"/g, '""')}"`;  }).join(","));
-    downloadCSV([headers.join(","), ...rows].join("\n"), "transactions.csv");
-    toast("CSV downloaded", "success");
+    const businessTransactions = transactions
+      .filter((transaction) => transaction.is_business !== false && transaction.user_confirmed !== false)
+      .sort((a, b) => (a.transaction_date ?? "").localeCompare(b.transaction_date ?? ""));
+    if (!businessTransactions.length) { toast("No business transactions to export", "info"); return; }
+    const escapeCSV = (value: unknown) => `"${String(value ?? "").replace(/"/g, '""')}"`;
+    const headers = [
+      "Date", "VoiceLedger Reference", "Provider Reference", "Merchant / Payee", "Description", "Type", "Money In", "Money Out",
+      "Currency", "Tax Status", "Allowable Expense", "Category", "Account Source", "Ingestion Source",
+      "Tags", "Notes", "Reimbursement Status", "Reimbursed Amount"
+    ];
+    const rows = businessTransactions.map((transaction) => {
+      const amount = parseMoneyFromRecord(transaction).toFixed(2);
+      return [
+        transaction.transaction_date,
+        transaction.id,
+        transaction.external_transaction_id,
+        transaction.merchant || transaction.description,
+        transaction.description,
+        transaction.type === "income" ? "Income" : "Expense",
+        transaction.type === "income" ? amount : "",
+        transaction.type === "expense" ? amount : "",
+        transaction.currency ?? baseCurrency,
+        "Business",
+        transaction.type === "expense" && transaction.tax_deductible ? "Yes" : "No",
+        transaction.category || "Uncategorised",
+        PAYMENT_SOURCE_LABELS[transaction.payment_source as keyof typeof PAYMENT_SOURCE_LABELS] ?? transaction.payment_source,
+        transaction.source,
+        Array.isArray(transaction.tags) ? transaction.tags.join("; ") : "",
+        transaction.notes,
+        transaction.reimbursement_status,
+        transaction.reimbursed_amount
+      ].map(escapeCSV).join(",");
+    });
+    const date = new Date().toISOString().slice(0, 10);
+    downloadCSV([headers.map(escapeCSV).join(","), ...rows].join("\r\n"), `voiceledger-tax-export-${date}.csv`);
+    toast(`Exported ${businessTransactions.length} business transactions`, "success");
   };
 
   const exportDirectorCSV = () => {
@@ -145,7 +171,7 @@ export default function ReportsPage() {
       <div className="flex items-end justify-between gap-4">
         <div>
           <h1 className="text-4xl font-bold text-stone-900" style={{ fontFamily: "Georgia, serif" }}>Reports</h1>
-          <p className="muted text-sm">Detailed breakdown for review with your accountant.</p>
+          <p className="muted text-sm">Business-only tax view. Personal transactions are excluded from totals and exports.</p>
         </div>
         <div className="flex shrink-0 items-center gap-3">
           <button className="flex items-center gap-2 rounded-xl border border-stone-300 bg-white px-4 py-2 text-sm text-stone-700 shadow-sm hover:bg-stone-50 transition-colors" style={{ borderColor: "var(--border)" }}>
@@ -158,7 +184,7 @@ export default function ReportsPage() {
             <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth={2.5} viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
             </svg>
-            Export CSV
+            Export tax CSV
           </button>
         </div>
       </div>
@@ -169,7 +195,7 @@ export default function ReportsPage() {
           {/* Summary metrics */}
           <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
             <div className="card">
-              <div className="text-sm muted">Total income</div>
+              <div className="text-sm muted">Business revenue</div>
               <div className="mt-2 text-2xl font-bold text-teal-700">{fmtCurrency(summary.totalIncome, baseCurrency)}</div>
             </div>
             <div className="card">
@@ -178,10 +204,11 @@ export default function ReportsPage() {
             </div>
             <div className="card">
               <div className="text-sm muted">Net profit / loss</div>
-              <div className={`mt-2 text-2xl font-bold ${summary.estimatedProfit >= 0 ? "text-teal-700" : "text-rose-600"}`}>{fmtCurrency(summary.estimatedProfit, baseCurrency)}</div>
+              <div className={`mt-2 text-2xl font-bold ${summary.netAllowablePosition >= 0 ? "text-teal-700" : "text-rose-600"}`}>{fmtCurrency(summary.netAllowablePosition, baseCurrency)}</div>
+              <div className="mt-1 text-xs muted">Revenue minus allowable expenses</div>
             </div>
             <div className="card">
-              <div className="text-sm muted">Tax deductible</div>
+              <div className="text-sm muted">Allowable expenses</div>
               <div className="mt-2 text-2xl font-bold text-stone-900">{fmtCurrency(summary.deductibleExpenses, baseCurrency)}</div>
             </div>
           </div>
@@ -227,7 +254,7 @@ export default function ReportsPage() {
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
             <div className="card lg:col-span-2">
               <div className="mb-5">
-                <h2 className="font-bold text-stone-900" style={{ fontFamily: "Georgia, serif" }}>Monthly income vs expenses</h2>
+              <h2 className="font-bold text-stone-900" style={{ fontFamily: "Georgia, serif" }}>Monthly revenue vs allowable expenses</h2>
                 <p className="text-sm muted">Last 12 months</p>
               </div>
               <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ height: 200 }}>
@@ -258,14 +285,14 @@ export default function ReportsPage() {
                 ))}
               </svg>
               <div className="mt-3 flex gap-5 text-xs muted">
-                <span className="flex items-center gap-1.5"><span className="inline-block h-2 w-2 rounded-full bg-teal-600" /> Income</span>
-                <span className="flex items-center gap-1.5"><span className="inline-block h-2 w-2 rounded-full bg-rose-300" /> Expenses</span>
+                  <span className="flex items-center gap-1.5"><span className="inline-block h-2 w-2 rounded-full bg-teal-600" /> Revenue</span>
+                  <span className="flex items-center gap-1.5"><span className="inline-block h-2 w-2 rounded-full bg-rose-300" /> Allowable expenses</span>
               </div>
             </div>
 
             <div className="card flex flex-col gap-5">
               <div>
-                <h2 className="font-bold text-stone-900" style={{ fontFamily: "Georgia, serif" }}>Top expense categories</h2>
+                <h2 className="font-bold text-stone-900" style={{ fontFamily: "Georgia, serif" }}>Top allowable expense categories</h2>
                 {topCategories.length ? (
                   <div className="mt-4 space-y-4">
                     {topCategories.map(([cat, amt], idx) => {
@@ -287,7 +314,7 @@ export default function ReportsPage() {
                       );
                     })}
                   </div>
-                ) : <p className="mt-3 text-sm muted">No expense categories yet.</p>}
+                ) : <p className="mt-3 text-sm muted">No allowable expense categories yet.</p>}
               </div>
 
               {/* Summary */}

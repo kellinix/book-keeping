@@ -11,7 +11,8 @@
     "db:apply:psql": "psql $DATABASE_URL -f db/schema.sql",
     "seed": "node ./scripts/seed.js",
     "ci": "npm run lint && npm run build",
-    "test:smoke": "node ./tests/smoke.test.js"
+    "test:smoke": "node ./tests/smoke.test.js",
+    "test": "node ./tests/period-derivation.test.js && node ./tests/ai-suggestion-state.test.js && node ./tests/reconciliation.test.js && node ./tests/voice-money.test.js && node ./tests/bank-categorization.test.js"
   },
   "dependencies": {
     "@heroicons/react": "^2.0.18",

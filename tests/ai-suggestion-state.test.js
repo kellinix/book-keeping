@@ -26,7 +26,8 @@ function isRefundCategory(cat) { return cat === REFUND_CAT; }
 
 function summarizeTransactions(transactions, options = {}) {
   const { confirmedOnly = true } = options;
-  const eligible = confirmedOnly ? transactions.filter(tx => tx.user_confirmed !== false) : transactions;
+  const businessTransactions = transactions.filter(tx => tx.is_business !== false && tx.excluded_from_reports !== true);
+  const eligible = confirmedOnly ? businessTransactions.filter(tx => tx.user_confirmed !== false) : businessTransactions;
   const pl = eligible.filter(tx => !isBalanceSheetCategory(tx.category));
   const totalIncome = pl.reduce((s, tx) => tx.type !== "income" || isRefundCategory(tx.category) ? s : s + parseMoneyFromRecord(tx), 0);
   const grossExpenses = pl.reduce((s, tx) => tx.type === "expense" ? s + parseMoneyFromRecord(tx) : s, 0);
@@ -35,7 +36,13 @@ function summarizeTransactions(transactions, options = {}) {
   const deductibleExpenses = eligible.reduce(
     (s, tx) => tx.type === "expense" && tx.tax_deductible && !isBalanceSheetCategory(tx.category) ? s + parseMoneyFromRecord(tx) : s, 0
   );
-  return { totalIncome, totalExpenses, deductibleExpenses, estimatedProfit: totalIncome - totalExpenses };
+  return {
+    totalIncome,
+    totalExpenses,
+    deductibleExpenses,
+    estimatedProfit: totalIncome - totalExpenses,
+    netAllowablePosition: totalIncome - deductibleExpenses
+  };
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -111,6 +118,30 @@ test("Director Loan excluded from income/expense totals regardless of confirmed 
   const tx = { type: "expense", category: "Director Loan", amount: 1000, amount_pence: null, tax_deductible: false, user_confirmed: true };
   const s = summarizeTransactions([tx]);
   assert.strictEqual(s.totalExpenses, 0);
+});
+
+console.log("\nbusiness and personal separation:");
+
+test("personal transactions are excluded from business totals", () => {
+  const personalIncome = { ...confirmed, amount: 900, is_business: false };
+  const personalExpense = { ...confirmedExp, amount: 400, is_business: false };
+  const s = summarizeTransactions([confirmed, confirmedExp, personalIncome, personalExpense]);
+  assert.strictEqual(s.totalIncome, 500);
+  assert.strictEqual(s.totalExpenses, 100);
+  assert.strictEqual(s.deductibleExpenses, 100);
+});
+
+test("net profit/loss uses revenue minus allowable expenses", () => {
+  const nonAllowable = { ...confirmedExp, amount: 40, tax_deductible: false };
+  const s = summarizeTransactions([confirmed, confirmedExp, nonAllowable]);
+  assert.strictEqual(s.estimatedProfit, 360);
+  assert.strictEqual(s.netAllowablePosition, 400);
+});
+
+test("soft-excluded duplicates do not contribute to reports", () => {
+  const duplicate = { ...confirmedExp, amount: 100, excluded_from_reports: true };
+  const s = summarizeTransactions([confirmed, confirmedExp, duplicate]);
+  assert.strictEqual(s.totalExpenses, 100);
 });
 
 // ─── Summary ──────────────────────────────────────────────────────────────────

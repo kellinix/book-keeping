@@ -19,6 +19,7 @@ type VoiceSuggestion = {
   payment_source?: PaymentSource;
   paid_by?: PaidBy;
   director_reimbursable?: boolean;
+  is_business?: boolean;
 };
 
 function formatTime(s: number) {
@@ -42,6 +43,7 @@ export default function VoiceRecorder({ onSaved }: { onSaved?: () => void }) {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const recordedBytesRef = useRef(0);
 
   const updateSuggestion = (index: number, patch: Partial<VoiceSuggestion>) => {
     setSuggestions((current) => current.map((item, i) => (i === index ? { ...item, ...patch } : item)));
@@ -62,12 +64,23 @@ export default function VoiceRecorder({ onSaved }: { onSaved?: () => void }) {
       const mediaRecorder = new MediaRecorder(stream);
       mediaRecorderRef.current = mediaRecorder;
       chunksRef.current = [];
+      recordedBytesRef.current = 0;
 
       mediaRecorder.ondataavailable = (event: BlobEvent) => {
-        if (event.data.size > 0) chunksRef.current.push(event.data);
+        if (event.data.size > 0) {
+          chunksRef.current.push(event.data);
+          recordedBytesRef.current += event.data.size;
+          if (recordedBytesRef.current >= 23 * 1024 * 1024 && mediaRecorder.state === "recording") {
+            setError("Recording stopped before the secure 25 MB upload limit. Review or save this note, then record the remainder separately.");
+            mediaRecorder.stop();
+            setRecording(false);
+          }
+        }
       };
 
       mediaRecorder.onstop = async () => {
+        if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+        setRecording(false);
         mediaRecorder.stream.getTracks().forEach((track) => track.stop());
         const blob = new Blob(chunksRef.current, { type: "audio/webm" });
         setAudioUrl(URL.createObjectURL(blob));
@@ -101,6 +114,7 @@ export default function VoiceRecorder({ onSaved }: { onSaved?: () => void }) {
               director_reimbursable: Boolean(item.director_reimbursable),
               paid_by: item.paid_by ?? "company",
               payment_source: item.payment_source ?? "business_account",
+              is_business: item.is_business !== false,
               type: item.type === "income" ? ("income" as const) : ("expense" as const)
             }))
             .filter((item) => item.amount > 0);
@@ -119,7 +133,7 @@ export default function VoiceRecorder({ onSaved }: { onSaved?: () => void }) {
         }
       };
 
-      mediaRecorder.start();
+      mediaRecorder.start(1000);
       setRecording(true);
       timerRef.current = setInterval(() => setRecordingSeconds((s) => s + 1), 1000);
     } catch (caughtError) {
@@ -141,41 +155,39 @@ export default function VoiceRecorder({ onSaved }: { onSaved?: () => void }) {
 
     setLoading(true);
     try {
-      const user = (await supabase.auth.getUser()).data.user;
-      if (!user) throw new Error("Please sign in before saving transactions.");
-
-      await supabase.from("profiles").upsert({
-        email: user.email,
-        full_name: user.user_metadata?.full_name ?? user.user_metadata?.name ?? null,
-        id: user.id
-      });
+      const token = (await supabase.auth.getSession()).data.session?.access_token;
+      if (!token) throw new Error("Please sign in before saving transactions.");
 
       const rows = validSuggestions.map((item) => {
         const reimbursable = Boolean(item.director_reimbursable) && (item.type === "expense");
         return {
           amount: Number(item.amount),
+          amount_pence: Math.round(Number(item.amount) * 100),
           category: item.category || "Other",
           confidence_score: item.confidence ?? null,
           currency: (item.currency ?? "GBP").toUpperCase(),
           description: item.description || item.merchant || transcription || "Voice note",
           director_reimbursable: reimbursable,
           merchant: item.merchant ?? null,
+          is_business: item.is_business !== false,
           notes: transcription,
           paid_by: item.paid_by ?? "company",
           payment_source: item.payment_source ?? "business_account",
           reimbursement_status: reimbursable ? "owed_to_director" : "not_applicable",
           source: "voice",
+          suggested_by_ai: true,
           tax_deductible: Boolean(item.tax_deductible),
           transaction_date: item.date || new Date().toISOString().slice(0, 10),
           type: item.type || "expense",
-          user_id: user.id
+          user_confirmed: true
         };
       });
 
-      const { error: insertError } = await supabase.from("transactions").insert(rows);
-      if (insertError) throw insertError;
+      const response = await fetch("/api/transactions", { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ transactions: rows }) });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || "Could not save voice transactions");
 
-      toast(`Saved ${rows.length} transaction${rows.length === 1 ? "" : "s"}`, "success");
+      toast(`Saved ${result.imported} transaction${result.imported === 1 ? "" : "s"}${result.skippedDuplicates ? `; skipped ${result.skippedDuplicates} duplicate${result.skippedDuplicates === 1 ? "" : "s"}` : ""}`, "success");
       setError(null);
       setTranscription(null);
       setSuggestions([]);
@@ -356,6 +368,10 @@ export default function VoiceRecorder({ onSaved }: { onSaved?: () => void }) {
               </div>
 
               <div className="mt-3 flex flex-wrap gap-4">
+                <label className="flex items-center gap-2 text-xs text-stone-600">
+                  <input checked={item.is_business !== false} onChange={(e) => updateSuggestion(index, { is_business: e.target.checked, tax_deductible: e.target.checked ? item.tax_deductible : false })} type="checkbox" className="rounded" />
+                  Business transaction
+                </label>
                 <label className="flex items-center gap-2 text-xs text-stone-600">
                   <input checked={Boolean(item.tax_deductible)} onChange={(e) => updateSuggestion(index, { tax_deductible: e.target.checked })} type="checkbox" className="rounded" />
                   Tax deductible

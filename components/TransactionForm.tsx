@@ -1,31 +1,44 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { supabase } from "../lib/supabaseClient";
 import { useToast } from "./Toast";
 import { isPersonalPaymentSource, PAID_BY_LABELS, PAYMENT_SOURCE_LABELS, PaidBy, PaymentSource, VOICELEDGER_CATEGORIES } from "../lib/voiceledger";
 
 type Props = {
   onSaved?: () => void;
+  initial?: Partial<{ amount: number; category: string; currency: string; date: string; description: string; merchant: string; taxDeductible: boolean; uploadId: string; isBusiness: boolean; type: "expense" | "income" }>;
 };
 
-export default function TransactionForm({ onSaved }: Props) {
+type AccountOption = { id: string; display_name: string; currency: string; account_number_masked: string | null };
+
+export default function TransactionForm({ onSaved, initial }: Props) {
   const { toast } = useToast();
-  const [amount, setAmount] = useState("");
-  const [category, setCategory] = useState("Other");
-  const [currency, setCurrency] = useState("GBP");
-  const [date, setDate] = useState<string>(new Date().toISOString().slice(0, 10));
-  const [description, setDescription] = useState("");
-  const [merchant, setMerchant] = useState("");
+  const [amount, setAmount] = useState(initial?.amount != null ? String(initial.amount) : "");
+  const [category, setCategory] = useState(initial?.category ?? "Other");
+  const [currency, setCurrency] = useState(initial?.currency ?? "GBP");
+  const [date, setDate] = useState<string>(initial?.date || new Date().toISOString().slice(0, 10));
+  const [description, setDescription] = useState(initial?.description ?? "");
+  const [merchant, setMerchant] = useState(initial?.merchant ?? "");
   const [notes, setNotes] = useState("");
-  const [taxDeductible, setTaxDeductible] = useState(false);
-  const [type, setType] = useState<"expense" | "income">("expense");
+  const [tags, setTags] = useState("");
+  const [isBusiness, setIsBusiness] = useState(initial?.isBusiness ?? true);
+  const [accounts, setAccounts] = useState<AccountOption[]>([]);
+  const [bankAccountId, setBankAccountId] = useState("");
+  const [taxDeductible, setTaxDeductible] = useState(initial?.taxDeductible ?? false);
+  const [type, setType] = useState<"expense" | "income">(initial?.type ?? "expense");
   const [paymentSource, setPaymentSource] = useState<PaymentSource>("business_account");
   const [paidBy, setPaidBy] = useState<PaidBy>("company");
   const [directorReimbursable, setDirectorReimbursable] = useState(false);
   const [loading, setLoading] = useState(false);
   const [suggestion, setSuggestion] = useState<any>(null);
   const [suggesting, setSuggesting] = useState(false);
+
+  useEffect(() => {
+    supabase.from("bank_accounts").select("id,display_name,currency,account_number_masked").order("display_name").then(({ data }) => {
+      setAccounts((data ?? []) as AccountOption[]);
+    });
+  }, []);
 
   const handlePaymentSourceChange = (value: PaymentSource) => {
     setPaymentSource(value);
@@ -76,8 +89,9 @@ export default function TransactionForm({ onSaved }: Props) {
     event.preventDefault();
     setLoading(true);
 
-    const user = (await supabase.auth.getUser()).data.user;
-    if (!user) {
+    const session = await supabase.auth.getSession();
+    const token = session.data.session?.access_token;
+    if (!token) {
       setLoading(false);
       toast("Please sign in before saving transactions.", "error");
       return;
@@ -85,9 +99,12 @@ export default function TransactionForm({ onSaved }: Props) {
 
     const reimbursementStatus = directorReimbursable && type === "expense" ? "owed_to_director" : "not_applicable";
 
-    const { error } = await supabase.from("transactions").insert([
-      {
+    const response = await fetch("/api/transactions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ transaction: {
         amount: Number(amount),
+        bank_account_id: bankAccountId || null,
         category,
         confidence_score: suggestion?.confidence ?? null,
         currency: currency.toUpperCase(),
@@ -95,23 +112,35 @@ export default function TransactionForm({ onSaved }: Props) {
         director_reimbursable: directorReimbursable,
         merchant,
         notes,
+        tags,
+        is_business: isBusiness,
         paid_by: paidBy,
         payment_source: paymentSource,
         reimbursement_status: reimbursementStatus,
-        source: "manual",
+        source: initial?.uploadId ? "receipt" : "manual",
+        suggested_by_ai: Boolean(suggestion),
         tax_deductible: taxDeductible,
         transaction_date: date,
         type,
-        user_id: user.id
-      }
-    ]);
+        user_confirmed: true
+      } })
+    });
+    const result = await response.json().catch(() => ({}));
+    const saved = result.data?.[0];
 
     setLoading(false);
-    if (error) {
-      // eslint-disable-next-line no-console
-      console.error(error);
-      toast(error.message, "error");
+    if (!response.ok) {
+      toast(result.error || "Could not save transaction", "error");
       return;
+    }
+    if (!saved?.id) {
+      toast("This transaction is already in the ledger.", "error");
+      return;
+    }
+
+    if (initial?.uploadId && saved?.id) {
+      const { error: receiptError } = await supabase.from("receipts").insert({ upload_id: initial.uploadId, transaction_id: saved.id });
+      if (receiptError) toast("Transaction saved, but the receipt could not be linked.", "error");
     }
 
     setAmount("");
@@ -119,6 +148,8 @@ export default function TransactionForm({ onSaved }: Props) {
     setDirectorReimbursable(false);
     setMerchant("");
     setNotes("");
+    setTags("");
+    setBankAccountId("");
     setPaidBy("company");
     setPaymentSource("business_account");
     setSuggestion(null);
@@ -145,6 +176,15 @@ export default function TransactionForm({ onSaved }: Props) {
           <input value={currency} onChange={(e) => setCurrency(e.target.value.slice(0, 3))} className="mt-1 w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-stone-900 uppercase focus:outline-none focus:border-teal-500" />
         </label>
       </div>
+
+      <label className="block text-sm">
+        Account source
+        <select value={bankAccountId} onChange={(e) => setBankAccountId(e.target.value)} className="mt-1 w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-stone-900 focus:outline-none focus:border-teal-500">
+          <option value="">Custom / unlinked account</option>
+          {accounts.map((account) => <option key={account.id} value={account.id}>{account.display_name}{account.account_number_masked ? ` ${account.account_number_masked}` : ""} · {account.currency}</option>)}
+        </select>
+        <span className="mt-1 block text-xs muted">Selecting a linked account enables cross-source duplicate matching.</span>
+      </label>
 
       <label className="block text-sm">
         Date
@@ -209,6 +249,11 @@ export default function TransactionForm({ onSaved }: Props) {
         Business expense paid personally
       </label>
 
+      <label className="flex items-center gap-2 rounded-lg border border-stone-200 p-3 text-sm">
+        <input checked={isBusiness} onChange={(e) => { setIsBusiness(e.target.checked); if (!e.target.checked) { setTaxDeductible(false); setDirectorReimbursable(false); } }} type="checkbox" />
+        <span><strong>Business transaction</strong><span className="block text-xs muted">Turn off for personal tracking; personal items stay out of business tax treatment.</span></span>
+      </label>
+
       {isPaidPersonally && (
         <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
           <p className="font-medium">Paid personally</p>
@@ -219,6 +264,11 @@ export default function TransactionForm({ onSaved }: Props) {
       <label className="flex items-center gap-2 text-sm">
         <input checked={taxDeductible} onChange={(e) => setTaxDeductible(e.target.checked)} type="checkbox" />
         Suggested tax deductible
+      </label>
+
+      <label className="block text-sm">
+        Tags
+        <input value={tags} onChange={(e) => setTags(e.target.value)} placeholder="travel, client-a, recurring" className="mt-1 w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-stone-900 focus:outline-none focus:border-teal-500" />
       </label>
 
       <label className="block text-sm">

@@ -4,8 +4,11 @@ import { getUserFromAuthHeader } from "../../../../lib/auth";
 import { ensureProfileForUser } from "../../../../lib/profiles";
 import { supabaseAdmin } from "../../../../lib/supabaseAdmin";
 import { normalizeCategory, parseMoney, VOICELEDGER_CATEGORIES } from "../../../../lib/voiceledger";
+import { amountAppearsExplicitly, extractExplicitMoneyMentions } from "../../../../lib/voiceMoney";
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY || "";
+const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
+const AUDIO_TYPES = new Set(["audio/webm", "audio/wav", "audio/x-wav", "audio/mpeg", "audio/mp3", "audio/mp4", "audio/m4a", "audio/ogg"]);
 if (!OPENAI_KEY) {
   // eslint-disable-next-line no-console
   console.warn("OPENAI_API_KEY not set; transcription will be skipped");
@@ -56,13 +59,24 @@ function normalizeExtractedTransaction(value: any, transcription: string, today:
     paid_by: paidBy,
     payment_source: paymentSource,
     tax_deductible: Boolean(value?.tax_deductible),
-    type: value?.type === "income" ? "income" : "expense"
+    type: value?.type === "income" ? "income" : "expense",
+    is_business: value?.is_business !== false
   };
+}
+
+function cleanFallbackMerchant(value: string) {
+  return value
+    .replace(/[,:;-]+$/g, "")
+    .replace(/^(?:and|then|also|plus|another)\s+/i, "")
+    .replace(/\s+(?:which|that)\s+(?:costs?|is|was)$/i, "")
+    .replace(/\s+(?:costs?|cost|is|was|for|at|of)$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function fallbackExtractTransactions(transcription: string, today: string) {
   const text = transcription.replace(/\s+/g, " ").trim();
-  const matches = Array.from(text.matchAll(/([A-Z][A-Za-z0-9 .&'-]{1,60}?)\s+(?:is|was|which is|for|at|of|:|,)?\s*(?:another\s+)?(?:[$£]\s*)?(\d+(?:\.\d{1,2})?)\s*(dollars?|usd|pounds?|gbp|£|\$)?/gi));
+  const amountMatches = extractExplicitMoneyMentions(text);
 
   // Detect personal payment language anywhere in the text
   const textLower = text.toLowerCase();
@@ -71,26 +85,28 @@ function fallbackExtractTransactions(transcription: string, today: string) {
   const paymentSource = isPersonalCard ? "personal_credit_card" : isPersonalAccount ? "personal_account" : "business_account";
   const paidBy = (isPersonalCard || isPersonalAccount) ? "director" : "company";
   const directorReimbursable = isPersonalCard || isPersonalAccount;
+  let previousAmountEnd = 0;
 
-  return matches.map((match) => {
-    const merchant = match[1].replace(/^(and|for|another|which is)\s+/i, "").trim();
-    const rawCurrency = String(match[3] ?? "").toLowerCase();
-    const currency = rawCurrency.includes("dollar") || rawCurrency.includes("usd") || rawCurrency.includes("$") ? "USD" : "GBP";
+  return amountMatches.map((match) => {
+    const leadingText = text.slice(previousAmountEnd, match.index).trim();
+    previousAmountEnd = match.end;
+    const merchant = cleanFallbackMerchant(leadingText);
+    const currency = match.currency;
     const lowerMerchant = merchant.toLowerCase();
     const category = lowerMerchant.includes("instagram") || lowerMerchant.includes("tiktok")
       ? "Marketing"
-      : lowerMerchant.includes("api") || lowerMerchant.includes("openai") || lowerMerchant.includes("sora")
+      : lowerMerchant.includes("api") || lowerMerchant.includes("openai") || lowerMerchant.includes("sora") || lowerMerchant.includes("subscription")
         ? "Software"
         : "Other";
 
     return normalizeExtractedTransaction(
       {
-        amount: match[2],
+        amount: match.amount,
         category,
         confidence: 0.45,
         currency,
         date: today,
-        description: `${merchant} payment`,
+        description: merchant,
         director_reimbursable: directorReimbursable,
         merchant,
         paid_by: paidBy,
@@ -102,7 +118,7 @@ function fallbackExtractTransactions(transcription: string, today: string) {
       transcription,
       today
     );
-  }).filter((item) => item.amount > 0);
+  }).filter((item) => item.amount > 0 && item.description);
 }
 
 export async function POST(req: Request) {
@@ -117,16 +133,19 @@ export async function POST(req: Request) {
   if (!file) return NextResponse.json({ error: "No file provided" }, { status: 400 });
   if (!user_id) return NextResponse.json({ error: "Missing user_id" }, { status: 400 });
   if (!OPENAI_KEY) return NextResponse.json({ error: "OPENAI_API_KEY is not configured" }, { status: 500 });
+  if (file.size > MAX_AUDIO_BYTES) return NextResponse.json({ error: "Audio must be 25 MB or smaller. Record a shorter note and retry." }, { status: 413 });
+  if (file.type && !AUDIO_TYPES.has(file.type)) return NextResponse.json({ error: "Unsupported audio format" }, { status: 415 });
 
   const arrayBuffer = await file.arrayBuffer();
   const buffer = Buffer.from(arrayBuffer);
 
-  // Upload audio to Supabase Storage (bucket: uploads)
+  // Raw audio is ephemeral by default. Opt in only when a documented retention
+  // policy and user-facing consent are in place.
   const timestamp = Date.now();
   const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 100);
   const key = `voices/${user_id}/${timestamp}-${safeName}`;
   let storedAudio = false;
-  try {
+  if (process.env.RETAIN_RAW_AUDIO === "true") try {
     const { error: uploadErr } = await supabaseAdmin.storage.from("uploads").upload(key, buffer, {
       contentType: file.type,
       upsert: false
@@ -152,19 +171,19 @@ export async function POST(req: Request) {
 
   let transcription = "";
   try {
-    const fd = new FormData();
-    const blob = new Blob([buffer], { type: file.type });
-    fd.append("file", blob, file.name);
-    fd.append("model", "whisper-1");
-
-    const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_KEY}` },
-      body: fd as any
-    });
-    const j = await resp.json();
-    if (!resp.ok) return NextResponse.json({ error: j.error?.message ?? "Transcription failed" }, { status: 502 });
-    transcription = j.text ?? j.transcript ?? "";
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const fd = new FormData();
+      fd.append("file", new Blob([buffer], { type: file.type }), file.name);
+      fd.append("model", process.env.OPENAI_TRANSCRIPTION_MODEL || "gpt-4o-transcribe");
+      const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", { method: "POST", headers: { Authorization: `Bearer ${OPENAI_KEY}` }, body: fd as any });
+      const j = await resp.json();
+      if (resp.ok) { transcription = j.text ?? j.transcript ?? ""; break; }
+      if ((resp.status === 429 || resp.status >= 500) && attempt < 2) {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(5000, (2 ** attempt) * 1000)));
+        continue;
+      }
+      return NextResponse.json({ error: resp.status === 429 ? "Voice AI is busy. Please retry shortly." : j.error?.message ?? "Transcription failed" }, { status: resp.status === 429 ? 429 : 502 });
+    }
     if (!transcription) return NextResponse.json({ error: "OpenAI returned an empty transcription. Try a clearer or longer recording." }, { status: 422 });
   } catch (e) {
     // eslint-disable-next-line no-console
@@ -180,8 +199,7 @@ export async function POST(req: Request) {
       const today = new Date().toISOString().slice(0, 10);
       const prompt = `Extract bookkeeping transactions from this voice note.
 
-Return valid JSON only in this exact shape:
-{"transactions":[{"amount":number,"currency":"GBP|USD|EUR or other 3-letter code","type":"income|expense","date":"YYYY-MM-DD","merchant":string,"description":string,"category":string,"tax_deductible":boolean,"confidence":number,"explanation":string,"payment_source":"business_account|personal_account|business_credit_card|personal_credit_card|cash|other","paid_by":"company|director|owner|employee|contractor|other","director_reimbursable":boolean}]}
+Return one object per payment. Classify whether each item is a business transaction independently from how it was paid.
 
 Rules:
 - If the note mentions multiple payments, return multiple transaction objects. Do not merge them.
@@ -194,15 +212,26 @@ Rules:
 - payment_source: detect phrases like "my personal card", "my personal account", "personal credit card", "my own account", "personally" → use "personal_account" or "personal_credit_card". Default to "business_account" if not mentioned.
 - paid_by: if payment_source is personal, set to "director". If company card or business account, set to "company".
 - director_reimbursable: set to true if payment_source is "personal_account" or "personal_credit_card" AND type is "expense".
+- is_business: false only when the speaker explicitly describes the transaction as personal; otherwise true.
 
 Voice note transcription:
 "${transcription}"`;
 
       const completion = await client.chat.completions.create({
-        model: "gpt-4o-mini",
+        model: process.env.OPENAI_EXTRACTION_MODEL || "gpt-4o-mini",
         messages: [{ role: "user", content: prompt }],
-        max_tokens: 500,
-        response_format: { type: "json_object" },
+        max_tokens: 2000,
+        response_format: { type: "json_schema", json_schema: { name: "voice_transactions", strict: true, schema: {
+          type: "object", additionalProperties: false, required: ["transactions"], properties: { transactions: { type: "array", items: {
+            type: "object", additionalProperties: false,
+            required: ["amount","currency","type","date","merchant","description","category","tax_deductible","confidence","explanation","payment_source","paid_by","director_reimbursable","is_business"],
+            properties: {
+              amount: { type: "number" }, currency: { type: "string" }, type: { type: "string", enum: ["income","expense"] }, date: { type: "string" }, merchant: { type: "string" }, description: { type: "string" },
+              category: { type: "string", enum: VOICELEDGER_CATEGORIES }, tax_deductible: { type: "boolean" }, confidence: { type: "number" }, explanation: { type: "string" },
+              payment_source: { type: "string", enum: ["business_account","personal_account","business_credit_card","personal_credit_card","cash","other"] }, paid_by: { type: "string", enum: ["company","director","owner","employee","contractor","other"] }, director_reimbursable: { type: "boolean" }, is_business: { type: "boolean" }
+            }
+          } } }
+        } } } as any,
         temperature: 0
       });
       const text = completion.choices?.[0]?.message?.content ?? "{}";
@@ -217,6 +246,11 @@ Voice note transcription:
       suggestions = rawTransactions
         .map((item: any) => normalizeExtractedTransaction(item, transcription, today))
         .filter((item: any) => item.amount > 0);
+
+      const explicitMentions = extractExplicitMoneyMentions(transcription);
+      if (explicitMentions.length > 1) {
+        suggestions = suggestions.filter((item: any) => amountAppearsExplicitly(explicitMentions, item.amount));
+      }
 
       if (!suggestions.length) {
         suggestions = fallbackExtractTransactions(transcription, today);
